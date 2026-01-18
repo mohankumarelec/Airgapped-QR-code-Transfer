@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -13,6 +13,18 @@
         class="flex flex-col items-start w-full items-center justify-center align-middle"
       >
         <div class="text-xl my-4">Data Sender Mode</div>
+        <div class="w-1/4 mb-4">
+          <select v-model.number="chunk_size">
+            <option v-for="size in chunk_sizes" :value="size.value">
+              {{ size.text }}
+            </option>
+          </select>
+          <select v-model="display_rate">
+            <option v-for="rate in display_rates" :value="rate.value">
+              {{ rate.text }}
+            </option>
+          </select>
+        </div>
         <div class="text-sm mb-4">{{user_message}}</div>
         <div class="w-1/2 mb-4">
           <input
@@ -48,7 +60,22 @@
         setup() {
           const user_message = ref("Choose file to get started");
           const is_transferring = ref(false);
-          const chunk_size = 250;
+
+          const chunk_size = ref(250);
+          const chunk_sizes = ref([
+            { text: "Small", value: 50 },
+            { text: "Medium", value: 100 },
+            { text: "Large", value: 250 },
+            { text: "X-Large", value: 500 },
+          ]);
+
+          const display_rate = ref(100);
+          const display_rates = ref([
+            { text: "Fast", value: 100 },
+            { text: "Medium", value: 500 },
+            { text: "Slow", value: 1000 },
+          ]);
+
           let qrcode_object = "";
 
           const encode_data = (index, input_bytes) => {
@@ -56,7 +83,7 @@
             let utf8Encoder = new TextEncoder();
             let utf8_bytes = utf8Encoder.encode(encoded_string);
             let encoded_data = btoa(
-              String.fromCharCode.apply(null, utf8_bytes)
+              String.fromCharCode.apply(null, utf8_bytes),
             );
             return index + "," + encoded_data;
           };
@@ -72,20 +99,20 @@
             let file = file_input.files[0];
             let data_chunks = [];
             let data_array = pako.gzip(await file.arrayBuffer(), { level: 9 });
-            let total_chunks = Math.ceil(data_array.length / chunk_size);
+            let total_chunks = Math.ceil(data_array.length / chunk_size.value);
             let file_metadata = { name: file.name, chunks: total_chunks };
             qrcode_object.clear();
             qrcode_object.makeCode(JSON.stringify(file_metadata));
             user_message.value = "Starting data transfer in few seconds ...";
             await new Promise((r) => setTimeout(r, 1000));
             for (let i = 0; i < total_chunks; i++) {
-              await new Promise((r) => setTimeout(r, 50));
-              let start = i * chunk_size;
-              let chunk = data_array.subarray(start, start + chunk_size);
+              await new Promise((r) => setTimeout(r, display_rate.value));
+              let start = i * chunk_size.value;
+              let chunk = data_array.subarray(start, start + chunk_size.value);
               let encoded_data = encode_data(i, chunk);
               qrcode_object.clear();
               qrcode_object.makeCode(encoded_data);
-              user_message.value = `Transfering Chunk ${i}/${total_chunks} ...`;
+              user_message.value = `Transferring Chunk ${i}/${total_chunks} ...`;
               if (!is_transferring.value) {
                 user_message.value = "Choose file to get started";
                 qrcode_object.clear();
@@ -113,9 +140,13 @@
 
           return {
             user_message,
+            is_transferring,
+            chunk_size,
+            chunk_sizes,
+            display_rate,
+            display_rates,
             start_transfer,
             stop_transfer,
-            is_transferring,
           };
         },
       }).mount("#app");
