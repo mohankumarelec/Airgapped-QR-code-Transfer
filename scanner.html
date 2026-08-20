@@ -32,12 +32,14 @@
         >
           Stop Receiver
         </button>
-        <video id="videoElement" muted autoplay playsinline></video>
+        <video id="videoElement" v-show="!is_showing" muted autoplay playsinline></video>
+        <div id="qrcode" v-show="is_showing"></div>
       </div>
     </div>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script>
       const { createApp, ref, reactive, onMounted, computed } = Vue;
 
@@ -45,10 +47,12 @@
         setup() {
           const user_message = ref("Click receive button to start receiving");
           const decoded_chunks = ref({});
-          const total_chunks = ref(-1);
           const file_metadata = reactive({});
           const is_receiving = ref(false);
-          let canvas, context, videoElement;
+          const is_showing = ref(false);
+          let canvas, context, videoElement, qrcode_object;
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
           const decode_data = (input_string) => {
             const encoded_data = atob(input_string.split(",")[1]);
@@ -68,6 +72,22 @@
             };
           };
 
+          const missing_to_hex = (missing_indices, total) => {
+            let bytes = new Uint8Array(Math.ceil(total / 8));
+            missing_indices.forEach((i) => {
+              bytes[i >> 3] |= 1 << (i & 7);
+            });
+            return Array.from(bytes)
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join("");
+          };
+
+          const show_qr = (text) => {
+            is_showing.value = true;
+            qrcode_object.clear();
+            qrcode_object.makeCode(text);
+          };
+
           const download_file = (data, fileName) => {
             const blob = new Blob([data]);
             const dummy_element = document.createElement("a");
@@ -80,59 +100,91 @@
 
           const stop_receiver = () => {
             is_receiving.value = false;
+            is_showing.value = false;
             decoded_chunks.value = {};
             Object.assign(file_metadata, {});
             user_message.value = "Click receive button to start receiving";
           };
 
-          const start_receiver = async () => {
-            decoded_chunks.value = {};
-            is_receiving.value = true;
-            while (
-              file_metadata.chunks != Object.keys(decoded_chunks.value).length
-            ) {
+          // Scans until it decodes a chunk frame ("index,base64"), a
+          // {type:"meta",...} frame, or a {type:"end_pass"} frame.
+          // Returns the parsed frame/result, or {type:"aborted"}.
+          const listen_for_pass = async () => {
+            is_showing.value = false;
+            while (is_receiving.value) {
               try {
-                await new Promise((r) => setTimeout(r, 10));
+                await sleep(10);
                 context.drawImage(videoElement, 0, 0);
-                image_data = context.getImageData(
+                let image_data = context.getImageData(
                   0,
                   0,
                   canvas.width,
                   canvas.height
                 );
                 let symbols = await zbarWasm.scanImageData(image_data);
-                if (!symbols || !symbols.length) {
-                  continue;
-                }
+                if (!symbols || !symbols.length) continue;
                 let decoded_data = symbols[0].decode();
-                if (decoded_data.includes("chunks")) {
-                  Object.assign(file_metadata, JSON.parse(decoded_data));
-                  decoded_chunks.value = {};
-                  user_message.value = `Transferring file: ${file_metadata.name}`;
-                } else if (decoded_data.split(",").length == 2) {
+                if (!decoded_data.startsWith("{")) {
                   let raw_data = decode_data(decoded_data);
                   decoded_chunks.value[raw_data["index"]] = raw_data["data"];
+                  user_message.value = `Received ${Object.keys(decoded_chunks.value).length}/${file_metadata.chunks || "?"} chunks ...`;
+                  continue;
                 }
-                window.decoded_chunks = decoded_chunks.value;
+                let frame;
+                try {
+                  frame = JSON.parse(decoded_data);
+                } catch (error) {
+                  continue;
+                }
+                if (frame.type === "meta") {
+                  Object.assign(file_metadata, {
+                    name: frame.name,
+                    chunks: frame.chunks,
+                  });
+                  user_message.value = `Transferring file: ${file_metadata.name}`;
+                } else if (frame.type === "end_pass") {
+                  return frame;
+                }
               } catch (error) {
                 console.error("Error in Loop: ", error);
               }
-              if (!is_receiving.value) {
-                Object.assign(file_metadata, {});
-                decoded_chunks.value = {};
-                user_message.value = "Click receive button to start receiving";
-                return true;
+            }
+            return { type: "aborted" };
+          };
+
+          const start_receiver = async () => {
+            decoded_chunks.value = {};
+            Object.assign(file_metadata, {});
+            is_receiving.value = true;
+
+            while (is_receiving.value) {
+              let end = await listen_for_pass();
+              if (!is_receiving.value || end.type === "aborted") break;
+              if (!file_metadata.chunks) continue; // haven't seen metadata yet
+
+              let missing = [];
+              for (let i = 0; i < file_metadata.chunks; i++) {
+                if (!(i in decoded_chunks.value)) missing.push(i);
+              }
+
+              if (missing.length === 0) {
+                user_message.value = "Data Transfer Complete";
+                let output_array = [];
+                for (let i = 0; i < file_metadata.chunks; i++) {
+                  output_array = output_array.concat(decoded_chunks.value[i]);
+                }
+                let inflated_array = pako.inflate(Uint8Array.from(output_array));
+                download_file(inflated_array, file_metadata.name);
+                show_qr(JSON.stringify({ type: "done" }));
+                await sleep(2000);
+                break;
+              } else {
+                let bitmap = missing_to_hex(missing, file_metadata.chunks);
+                show_qr(JSON.stringify({ type: "missing", bitmap }));
+                user_message.value = `Missing ${missing.length} chunk(s). Point this device's camera at the sender's screen ...`;
+                await sleep(1500);
               }
             }
-            user_message.value = "Data Transfer Complete";
-            output_array = [];
-            for (let i = 0; i < file_metadata.chunks; i++) {
-              output_array = output_array.concat(decoded_chunks.value[i]);
-            }
-            let output_unit8array = Uint8Array.from(output_array);
-            window.output_unit8array = output_unit8array;
-            let infalted_array = pako.inflate(window.output_unit8array);
-            download_file(infalted_array, file_metadata.name);
             stop_receiver();
           };
 
@@ -148,12 +200,25 @@
             canvas.height = videoElement.videoHeight;
             canvas.width = videoElement.videoWidth;
             context.drawImage(videoElement, 0, 0);
+
+            let lowest_size =
+              Math.min(window.innerWidth, window.innerHeight) / 1.5;
+            qrcode_object = new QRCode("qrcode", {
+              text: "",
+              width: lowest_size,
+              height: lowest_size,
+              typeNumber: 40,
+              colorDark: "#000000",
+              colorLight: "#ffffff",
+              correctLevel: QRCode.CorrectLevel.M,
+            });
           });
 
           return {
             user_message,
             start_receiver,
             is_receiving,
+            is_showing,
             file_metadata,
             decoded_chunks,
             stop_receiver,

@@ -35,12 +35,14 @@
         >
           Stop Transfer
         </button>
-        <div id="qrcode" class=""></div>
+        <div id="qrcode" v-show="!is_listening"></div>
+        <video id="videoElement" v-show="is_listening" muted autoplay playsinline></video>
       </div>
     </div>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
     <script>
       const { createApp, ref, onMounted } = Vue;
 
@@ -48,8 +50,12 @@
         setup() {
           const user_message = ref("Choose file to get started");
           const is_transferring = ref(false);
+          const is_listening = ref(false);
           const chunk_size = 250;
           let qrcode_object = "";
+          let videoElement, canvas, context;
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
           const encode_data = (index, input_bytes) => {
             let encoded_string = String.fromCharCode.apply(null, input_bytes);
@@ -61,36 +67,123 @@
             return index + "," + encoded_data;
           };
 
+          const show_qr = (text) => {
+            qrcode_object.clear();
+            qrcode_object.makeCode(text);
+          };
+
+          const hex_to_missing_indices = (hex, total) => {
+            let bytes = hex.match(/.{1,2}/g).map((h) => parseInt(h, 16));
+            let missing = [];
+            for (let i = 0; i < total; i++) {
+              if (bytes[i >> 3] & (1 << (i & 7))) missing.push(i);
+            }
+            return missing;
+          };
+
+          const init_camera = async () => {
+            if (videoElement) return;
+            videoElement = document.getElementById("videoElement");
+            videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
+              video: { facingMode: "environment" },
+            });
+            canvas = document.createElement("canvas");
+            context = canvas.getContext("2d");
+            await sleep(2000);
+            canvas.height = videoElement.videoHeight;
+            canvas.width = videoElement.videoWidth;
+          };
+
+          // Waits for a control frame (JSON envelope) whose "type" is in accepted_types.
+          // Ignores chunk frames ("index,base64data") seen while listening.
+          const wait_for_control_frame = async (accepted_types) => {
+            await init_camera();
+            is_listening.value = true;
+            try {
+              while (is_transferring.value) {
+                await sleep(10);
+                context.drawImage(videoElement, 0, 0);
+                let image_data = context.getImageData(
+                  0,
+                  0,
+                  canvas.width,
+                  canvas.height
+                );
+                let symbols = await zbarWasm.scanImageData(image_data);
+                if (!symbols || !symbols.length) continue;
+                let decoded_data = symbols[0].decode();
+                if (!decoded_data.startsWith("{")) continue; // chunk frame, not for us
+                let frame;
+                try {
+                  frame = JSON.parse(decoded_data);
+                } catch (error) {
+                  continue;
+                }
+                if (accepted_types.includes(frame.type)) {
+                  return frame;
+                }
+              }
+              return { type: "aborted" };
+            } finally {
+              is_listening.value = false;
+            }
+          };
+
           const stop_transfer = () => {
             is_transferring.value = false;
+            is_listening.value = false;
             user_message.value = "Choose file to get started";
+            show_qr("Choose file to get started");
           };
 
           const start_transfer = async () => {
             let file_input = document.getElementById("file_input");
             is_transferring.value = true;
             let file = file_input.files[0];
-            let data_chunks = [];
             let data_array = pako.gzip(await file.arrayBuffer(), { level: 9 });
             let total_chunks = Math.ceil(data_array.length / chunk_size);
-            let file_metadata = { name: file.name, chunks: total_chunks };
-            qrcode_object.clear();
-            qrcode_object.makeCode(JSON.stringify(file_metadata));
-            user_message.value = "Starting data transfer in few seconds ...";
-            await new Promise((r) => setTimeout(r, 1000));
+            let chunks = [];
             for (let i = 0; i < total_chunks; i++) {
-              await new Promise((r) => setTimeout(r, 50));
               let start = i * chunk_size;
-              let chunk = data_array.subarray(start, start + chunk_size);
-              let encoded_data = encode_data(i, chunk);
-              qrcode_object.clear();
-              qrcode_object.makeCode(encoded_data);
-              user_message.value = `Transfering Chunk ${i}/${total_chunks} ...`;
-              if (!is_transferring.value) {
-                user_message.value = "Choose file to get started";
-                qrcode_object.clear();
-                qrcode_object.makeCode("Choose file to get started");
-                break;
+              chunks.push(data_array.subarray(start, start + chunk_size));
+            }
+            let file_metadata = { name: file.name, chunks: total_chunks };
+            let missing = new Set(chunks.map((_, i) => i));
+
+            while (missing.size > 0 && is_transferring.value) {
+              show_qr(JSON.stringify({ type: "meta", ...file_metadata }));
+              user_message.value = "Sending metadata...";
+              await sleep(1000);
+
+              let ordered_missing = Array.from(missing).sort((a, b) => a - b);
+              for (let n = 0; n < ordered_missing.length; n++) {
+                if (!is_transferring.value) break;
+                let idx = ordered_missing[n];
+                show_qr(encode_data(idx, chunks[idx]));
+                user_message.value = `Sending chunk ${n + 1}/${ordered_missing.length} ...`;
+                await sleep(50);
+              }
+              if (!is_transferring.value) break;
+
+              show_qr(JSON.stringify({ type: "end_pass" }));
+              user_message.value =
+                "Pass complete. Point this device's camera at the receiver's screen ...";
+              await sleep(1000);
+
+              let response = await wait_for_control_frame(["missing", "done"]);
+              if (!is_transferring.value) break;
+
+              if (response.type === "done") {
+                missing = new Set();
+                user_message.value = "Transfer complete!";
+              } else if (response.type === "missing") {
+                missing = new Set(
+                  hex_to_missing_indices(response.bitmap, total_chunks)
+                );
+                user_message.value = `Retrying ${missing.size} missing chunk(s) ...`;
+                await sleep(1000);
+              } else {
+                break; // aborted
               }
             }
             stop_transfer();
@@ -116,6 +209,7 @@
             start_transfer,
             stop_transfer,
             is_transferring,
+            is_listening,
           };
         },
       }).mount("#app");
