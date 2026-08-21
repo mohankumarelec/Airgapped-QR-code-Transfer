@@ -15,57 +15,179 @@
         <div class="text-xl my-4">Data Receiver Mode</div>
         <div class="text-sm mb-4">{{user_message}}</div>
         <div class="text-sm mb-4">
-          Progress: {{Object.keys(decoded_chunks).length}} /
-          {{file_metadata.chunks || 0}}
+          Progress: {{chunk_count}} / {{file_metadata.chunks || 0}}
         </div>
+
         <button
-          v-if="!is_receiving"
+          v-if="phase === 'idle'"
           v-on:click="start_receiver"
           class="mb-6 p-1 border-2 border-gray-500"
         >
           Start Receiver
         </button>
+
+        <div v-if="phase === 'ready_to_save'" class="flex flex-col items-center gap-2 mb-6">
+          <div class="text-sm">All {{file_metadata.chunks}} chunks received.</div>
+          <button
+            v-on:click="save_file"
+            class="p-2 border-2 border-green-600 bg-green-50 font-bold"
+          >
+            Save File
+          </button>
+        </div>
+
+        <div v-if="phase === 'pass_done'" class="flex flex-col items-center gap-2 mb-6">
+          <div class="text-sm">{{missing_count}} chunk(s) still missing</div>
+          <div class="flex gap-4">
+            <button v-on:click="show_missing_qr" class="p-1 border-2 border-gray-500">
+              Show Missing Chunk QR
+            </button>
+            <button v-on:click="start_next_scan" class="p-1 border-2 border-gray-500">
+              Start Next Scan
+            </button>
+          </div>
+        </div>
+
+        <div v-if="phase === 'showing_report'" class="flex flex-col items-center gap-2 mb-6">
+          <div class="text-sm">
+            Report part {{report_part_index + 1}} / {{report_part_count}}
+          </div>
+          <div class="flex gap-4">
+            <button
+              v-if="report_part_index < report_part_count - 1"
+              v-on:click="next_report_part"
+              class="p-1 border-2 border-gray-500"
+            >
+              Next Part
+            </button>
+            <button v-on:click="start_next_scan" class="p-1 border-2 border-gray-500">
+              Start Next Scan
+            </button>
+          </div>
+        </div>
+
+        <div v-if="phase === 'scanning'" class="flex gap-4 mb-6">
+          <button v-on:click="cancel_scan" class="p-1 border-2 border-gray-500">
+            Cancel Scan
+          </button>
+        </div>
+
+        <div v-if="camera_error" class="w-1/2 mb-6 p-4 border-2 border-red-500 bg-red-50">
+          <div class="text-sm text-red-700 mb-3">{{camera_error}}</div>
+          <div class="flex gap-4">
+            <button v-on:click="retry_camera" class="p-1 border-2 border-gray-500">
+              Retry
+            </button>
+            <button v-on:click="dismiss_camera_error" class="p-1 border-2 border-gray-500">
+              Back
+            </button>
+          </div>
+        </div>
+
         <button
-          v-else
-          v-on:click="stop_receiver"
+          v-if="phase !== 'idle' && phase !== 'complete'"
+          v-on:click="cancel_receiver"
           class="mb-6 p-1 border-2 border-gray-500"
         >
-          Stop Receiver
+          Cancel Receiving
         </button>
-        <video id="videoElement" muted autoplay playsinline></video>
+        <button
+          v-if="phase === 'complete'"
+          v-on:click="cancel_receiver"
+          class="mb-6 p-1 border-2 border-gray-500"
+        >
+          Receive Another File
+        </button>
+
+        <video id="videoElement" v-show="phase === 'scanning'" muted autoplay playsinline></video>
+        <div id="qrcode" v-show="qr_visible"></div>
       </div>
     </div>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script>
-      const { createApp, ref, reactive, onMounted, computed } = Vue;
+      const { createApp, ref, reactive, onMounted } = Vue;
 
       createApp({
         setup() {
           const user_message = ref("Click receive button to start receiving");
-          const decoded_chunks = ref({});
-          const total_chunks = ref(-1);
+          // Deliberately NOT reactive: Vue deep-wraps stored values in a
+          // Proxy, and reassembly reads millions of bytes back out through
+          // it. chunk_count carries the progress number for the UI instead.
+          let decoded_chunks = {};
+          const chunk_count = ref(0);
           const file_metadata = reactive({});
-          const is_receiving = ref(false);
-          let canvas, context, videoElement;
+          const phase = ref("idle"); // idle | scanning | pass_done | complete
+          const camera_error = ref(null);
+          const qr_visible = ref(false);
+          const report_part_index = ref(0);
+          const report_part_count = ref(0);
+          const missing_count = ref(0);
+          // Hex chars of bitmap per report QR. 1000 hex chars = 500 bytes =
+          // 4000 chunk indices per part, well inside QR capacity and still
+          // comfortably scannable off a phone screen.
+          const report_part_size = 1000;
+          let report_frames = [];
+          let canvas, context, videoElement, qrcode_object, media_stream;
+          let scan_abort = false;
 
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          // Decode base64 straight to bytes. Chunks are kept as Uint8Array,
+          // not plain Arrays of boxed numbers -- at 10k chunks the boxed form
+          // cost ~10x the heap and made reassembly crawl.
           const decode_data = (input_string) => {
-            const encoded_data = atob(input_string.split(",")[1]);
-            const encoded_array = Array.from(encoded_data, (char) =>
-              char.charCodeAt(0)
-            );
-            const utf8Decoder = new TextDecoder();
-            const output_string = utf8Decoder.decode(
-              new Uint8Array(encoded_array)
-            );
-            const data_array = Array.from(output_string, (char) =>
-              char.charCodeAt(0)
-            );
-            return {
-              index: parseInt(input_string.split(",")[0]),
-              data: data_array,
-            };
+            const comma = input_string.indexOf(",");
+            const binary = atob(input_string.slice(comma + 1));
+            const data = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              data[i] = binary.charCodeAt(i);
+            }
+            return { index: parseInt(input_string.slice(0, comma)), data };
+          };
+
+          const missing_to_hex = (missing_indices, total) => {
+            let bytes = new Uint8Array(Math.ceil(total / 8));
+            missing_indices.forEach((i) => {
+              bytes[i >> 3] |= 1 << (i & 7);
+            });
+            return Array.from(bytes)
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join("");
+          };
+
+          // Chrome/Android exposes non-standard focusMode control; keeps the
+          // camera continuously focused on the QR code instead of hunting.
+          const apply_continuous_focus = (stream) => {
+            let track = stream.getVideoTracks()[0];
+            if (!track || !track.getCapabilities) return;
+            let capabilities = track.getCapabilities();
+            if (capabilities.focusMode && capabilities.focusMode.includes("continuous")) {
+              track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => {});
+            }
+          };
+
+          const describe_camera_error = (error) => {
+            switch (error.name) {
+              case "NotAllowedError":
+                return "Camera access was denied. Allow camera permission for this page in your browser settings, then retry.";
+              case "NotFoundError":
+                return "No camera was found on this device.";
+              case "NotReadableError":
+                return "The camera is in use by another app, or a hardware error occurred.";
+              case "OverconstrainedError":
+                return "No camera on this device satisfies the requested settings.";
+              default:
+                return `Could not access the camera: ${error.message || error.name}`;
+            }
+          };
+
+          const show_qr = (text) => {
+            qr_visible.value = true;
+            qrcode_object.clear();
+            qrcode_object.makeCode(text);
           };
 
           const download_file = (data, fileName) => {
@@ -78,85 +200,257 @@
             URL.revokeObjectURL(url);
           };
 
-          const stop_receiver = () => {
-            is_receiving.value = false;
-            decoded_chunks.value = {};
-            Object.assign(file_metadata, {});
-            user_message.value = "Click receive button to start receiving";
+          const wait_for_video_ready = (video) =>
+            new Promise((resolve) => {
+              if (video.videoWidth) resolve();
+              else video.addEventListener("loadedmetadata", () => resolve(), { once: true });
+            });
+
+          const stop_camera_stream = () => {
+            if (media_stream) {
+              media_stream.getTracks().forEach((t) => t.stop());
+              media_stream = null;
+            }
           };
 
-          const start_receiver = async () => {
-            decoded_chunks.value = {};
-            is_receiving.value = true;
-            while (
-              file_metadata.chunks != Object.keys(decoded_chunks.value).length
-            ) {
+          const cancel_scan = () => {
+            scan_abort = true;
+            stop_camera_stream();
+            phase.value = "pass_done";
+            user_message.value = "Scan cancelled. Choose an action below.";
+          };
+
+          const dismiss_camera_error = () => {
+            camera_error.value = null;
+            phase.value = "pass_done";
+          };
+
+          const scan_loop = async () => {
+            while (!scan_abort) {
+              await sleep(10);
               try {
-                await new Promise((r) => setTimeout(r, 10));
                 context.drawImage(videoElement, 0, 0);
-                image_data = context.getImageData(
+                let image_data = context.getImageData(
                   0,
                   0,
                   canvas.width,
                   canvas.height
                 );
                 let symbols = await zbarWasm.scanImageData(image_data);
-                if (!symbols || !symbols.length) {
+                if (!symbols || !symbols.length) continue;
+                let decoded_data = symbols[0].decode();
+                if (!decoded_data.startsWith("{")) {
+                  let raw_data = decode_data(decoded_data);
+                  if (!(raw_data.index in decoded_chunks)) chunk_count.value++;
+                  decoded_chunks[raw_data.index] = raw_data.data;
+                  user_message.value = `Received ${chunk_count.value}/${file_metadata.chunks || "?"} chunks ...`;
                   continue;
                 }
-                let decoded_data = symbols[0].decode();
-                if (decoded_data.includes("chunks")) {
-                  Object.assign(file_metadata, JSON.parse(decoded_data));
-                  decoded_chunks.value = {};
-                  user_message.value = `Transferring file: ${file_metadata.name}`;
-                } else if (decoded_data.split(",").length == 2) {
-                  let raw_data = decode_data(decoded_data);
-                  decoded_chunks.value[raw_data["index"]] = raw_data["data"];
+                let frame;
+                try {
+                  frame = JSON.parse(decoded_data);
+                } catch (error) {
+                  continue;
                 }
-                window.decoded_chunks = decoded_chunks.value;
+                if (frame.type === "meta") {
+                  Object.assign(file_metadata, {
+                    name: frame.name,
+                    chunks: frame.chunks,
+                  });
+                  user_message.value = `Transferring file: ${file_metadata.name}`;
+                } else if (frame.type === "end_pass") {
+                  stop_camera_stream();
+                  let missing = compute_missing();
+                  missing_count.value = missing.length;
+                  if (file_metadata.chunks && missing.length === 0) {
+                    phase.value = "ready_to_save";
+                    user_message.value = "All chunks received. Save the file below.";
+                  } else {
+                    phase.value = "pass_done";
+                    user_message.value = `Pass complete. ${missing.length} chunk(s) still missing.`;
+                  }
+                  return;
+                }
               } catch (error) {
-                console.error("Error in Loop: ", error);
-              }
-              if (!is_receiving.value) {
-                Object.assign(file_metadata, {});
-                decoded_chunks.value = {};
-                user_message.value = "Click receive button to start receiving";
-                return true;
+                console.error("Error in scan loop: ", error);
               }
             }
-            user_message.value = "Data Transfer Complete";
-            output_array = [];
-            for (let i = 0; i < file_metadata.chunks; i++) {
-              output_array = output_array.concat(decoded_chunks.value[i]);
-            }
-            let output_unit8array = Uint8Array.from(output_array);
-            window.output_unit8array = output_unit8array;
-            let infalted_array = pako.inflate(window.output_unit8array);
-            download_file(infalted_array, file_metadata.name);
-            stop_receiver();
           };
 
-          onMounted(async () => {
-            console.log("Application Initialized ...");
+          const start_camera = async () => {
+            camera_error.value = null;
+            phase.value = "scanning";
+            try {
+              media_stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                  facingMode: "environment",
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                  advanced: [{ focusMode: "continuous" }],
+                },
+              });
+            } catch (error) {
+              camera_error.value = describe_camera_error(error);
+              phase.value = "pass_done";
+              return;
+            }
+            apply_continuous_focus(media_stream);
             videoElement = document.getElementById("videoElement");
-            videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
-            });
+            videoElement.srcObject = media_stream;
             canvas = document.createElement("canvas");
             context = canvas.getContext("2d");
-            await new Promise((r) => setTimeout(r, 2000));
-            canvas.height = videoElement.videoHeight;
+            await wait_for_video_ready(videoElement);
             canvas.width = videoElement.videoWidth;
-            context.drawImage(videoElement, 0, 0);
+            canvas.height = videoElement.videoHeight;
+            scan_abort = false;
+            scan_loop();
+          };
+
+          const retry_camera = () => start_camera();
+
+          const start_receiver = () => {
+            decoded_chunks = {};
+            chunk_count.value = 0;
+            Object.assign(file_metadata, {});
+            qr_visible.value = false;
+            start_camera();
+          };
+
+          const start_next_scan = () => {
+            qr_visible.value = false;
+            start_camera();
+          };
+
+          const compute_missing = () => {
+            let missing = [];
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              if (!(i in decoded_chunks)) missing.push(i);
+            }
+            return missing;
+          };
+
+          const save_file = () => {
+            // Allocate once and blit each chunk into place. Growing an array
+            // with concat() per chunk is O(n^2) — it took ~14s for a 2.5MB
+            // file, which read as the app being stuck.
+            let total_length = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              total_length += decoded_chunks[i].length;
+            }
+            const output = new Uint8Array(total_length);
+            let offset = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              output.set(decoded_chunks[i], offset);
+              offset += decoded_chunks[i].length;
+            }
+            let inflated_array;
+            try {
+              inflated_array = pako.inflate(output);
+            } catch (error) {
+              // All chunks arrived but the reassembled stream is not valid
+              // gzip — a chunk decoded to the wrong bytes. Only a full resend
+              // can fix it, so send the user back to the start.
+              user_message.value =
+                "All chunks received but the file is corrupt. Restart the transfer from the sender.";
+              return;
+            }
+            download_file(inflated_array, file_metadata.name);
+            user_message.value = `Saved ${file_metadata.name}. Show this QR to the sender so it can stop.`;
+            show_qr(JSON.stringify({ type: "done" }));
+            phase.value = "complete";
+          };
+
+          const show_missing_qr = () => {
+            if (!file_metadata.chunks) {
+              user_message.value = "No metadata received yet — start a scan first.";
+              return;
+            }
+            let missing = compute_missing();
+            if (missing.length === 0) {
+              phase.value = "ready_to_save";
+              user_message.value = "All chunks received. Save the file below.";
+            } else {
+              let bitmap = missing_to_hex(missing, file_metadata.chunks);
+              let slices = bitmap.match(
+                new RegExp(`.{1,${report_part_size}}`, "g")
+              );
+              report_frames = slices.map((slice, i) =>
+                JSON.stringify({
+                  type: "missing",
+                  part: i,
+                  parts: slices.length,
+                  bitmap: slice,
+                })
+              );
+              report_part_count.value = slices.length;
+              report_part_index.value = 0;
+              phase.value = "showing_report";
+              show_report_part();
+              user_message.value = `${missing.length} chunk(s) missing. Point the sender's camera at this screen.`;
+            }
+          };
+
+          const show_report_part = () => {
+            show_qr(report_frames[report_part_index.value]);
+          };
+
+          const next_report_part = () => {
+            if (report_part_index.value < report_part_count.value - 1) {
+              report_part_index.value += 1;
+              show_report_part();
+            }
+          };
+
+          const cancel_receiver = () => {
+            scan_abort = true;
+            stop_camera_stream();
+            camera_error.value = null;
+            qr_visible.value = false;
+            decoded_chunks = {};
+            chunk_count.value = 0;
+            Object.assign(file_metadata, {});
+            report_frames = [];
+            report_part_count.value = 0;
+            report_part_index.value = 0;
+            missing_count.value = 0;
+            phase.value = "idle";
+            user_message.value = "Click receive button to start receiving";
+          };
+
+          onMounted(() => {
+            console.log("Application Initialized ...");
+            let lowest_size =
+              Math.min(window.innerWidth, window.innerHeight) / 1.5;
+            qrcode_object = new QRCode("qrcode", {
+              text: "",
+              width: lowest_size,
+              height: lowest_size,
+              typeNumber: 40,
+              colorDark: "#000000",
+              colorLight: "#ffffff",
+              correctLevel: QRCode.CorrectLevel.M,
+            });
           });
 
           return {
             user_message,
-            start_receiver,
-            is_receiving,
+            phase,
+            camera_error,
+            qr_visible,
             file_metadata,
-            decoded_chunks,
-            stop_receiver,
+            chunk_count,
+            report_part_index,
+            report_part_count,
+            missing_count,
+            save_file,
+            start_receiver,
+            start_next_scan,
+            show_missing_qr,
+            next_report_part,
+            cancel_scan,
+            retry_camera,
+            dismiss_camera_error,
+            cancel_receiver,
           };
         },
       }).mount("#app");
