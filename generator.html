@@ -14,29 +14,74 @@
       >
         <div class="text-xl my-4">Data Sender Mode</div>
         <div class="text-sm mb-4">{{user_message}}</div>
-        <div class="w-1/2 mb-4">
+
+        <div v-if="phase === 'idle'" class="w-1/2 mb-4">
           <input
             class="block w-full text-sm text-gray-900 border border-gray-300 cursor-pointer bg-gray-50 focus:outline-none"
             id="file_input"
             type="file"
           />
         </div>
+
         <button
-          v-if="!is_transferring"
+          v-if="phase === 'idle'"
           v-on:click="start_transfer"
           class="mb-6 p-1 border-2 border-gray-500"
         >
           Start Transfer
         </button>
+
+        <div v-if="phase === 'pass_done'" class="flex gap-4 mb-6">
+          <button v-on:click="start_camera" class="p-1 border-2 border-gray-500">
+            Start Camera
+          </button>
+          <button v-on:click="restart_transfer" class="p-1 border-2 border-gray-500">
+            Restart
+          </button>
+        </div>
+
+        <div v-if="phase === 'camera_scanning'" class="flex flex-col items-center gap-2 mb-6">
+          <div v-if="report_progress" class="text-sm">{{report_progress}}</div>
+          <button v-on:click="stop_camera_scan" class="p-1 border-2 border-gray-500">
+            Cancel Scan
+          </button>
+        </div>
+
+        <div v-if="phase === 'ready_to_resend'" class="mb-6">
+          <button v-on:click="run_pass" class="p-1 border-2 border-gray-500">
+            Start Showing QR Again
+          </button>
+        </div>
+
+        <div v-if="camera_error" class="w-1/2 mb-6 p-4 border-2 border-red-500 bg-red-50">
+          <div class="text-sm text-red-700 mb-3">{{camera_error}}</div>
+          <div class="flex gap-4">
+            <button v-on:click="start_camera" class="p-1 border-2 border-gray-500">
+              Retry
+            </button>
+            <button v-on:click="dismiss_camera_error" class="p-1 border-2 border-gray-500">
+              Back
+            </button>
+          </div>
+        </div>
+
         <button
-          v-else
-          v-on:click="stop_transfer"
+          v-if="phase !== 'idle' && phase !== 'complete'"
+          v-on:click="cancel_transfer"
           class="mb-6 p-1 border-2 border-gray-500"
         >
-          Stop Transfer
+          Cancel Transfer
         </button>
-        <div id="qrcode" v-show="!is_listening"></div>
-        <video id="videoElement" v-show="is_listening" muted autoplay playsinline></video>
+        <button
+          v-if="phase === 'complete'"
+          v-on:click="cancel_transfer"
+          class="mb-6 p-1 border-2 border-gray-500"
+        >
+          Start New Transfer
+        </button>
+
+        <div id="qrcode" v-show="qr_visible"></div>
+        <video id="videoElement" v-show="phase === 'camera_scanning'" muted autoplay playsinline></video>
       </div>
     </div>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
@@ -49,27 +94,44 @@
       createApp({
         setup() {
           const user_message = ref("Choose file to get started");
-          const is_transferring = ref(false);
-          const is_listening = ref(false);
+          const phase = ref("idle"); // idle | sending | pass_done | camera_scanning | ready_to_resend | complete
+          const camera_error = ref(null);
           const chunk_size = 250;
           let qrcode_object = "";
-          let videoElement, canvas, context;
+          const report_progress = ref("");
+          const qr_visible = ref(true);
+          let videoElement, canvas, context, media_stream;
+          let chunks, total_chunks, file_name, missing_indices;
+          let scan_abort = false;
+          let report_parts = {};
+          let report_total_parts = 0;
 
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+          // Base64 the raw bytes directly. An earlier version round-tripped
+          // through TextEncoder, which expanded every byte >= 0x80 into two
+          // UTF-8 bytes and inflated the payload ~1.48x for no benefit --
+          // denser QR codes and nothing gained.
           const encode_data = (index, input_bytes) => {
-            let encoded_string = String.fromCharCode.apply(null, input_bytes);
-            let utf8Encoder = new TextEncoder();
-            let utf8_bytes = utf8Encoder.encode(encoded_string);
-            let encoded_data = btoa(
-              String.fromCharCode.apply(null, utf8_bytes)
-            );
-            return index + "," + encoded_data;
+            let binary = "";
+            for (let i = 0; i < input_bytes.length; i++) {
+              binary += String.fromCharCode(input_bytes[i]);
+            }
+            return index + "," + btoa(binary);
           };
 
           const show_qr = (text) => {
+            qr_visible.value = true;
             qrcode_object.clear();
             qrcode_object.makeCode(text);
+          };
+
+          // Wipe the QR off screen. Critical after a pass: a lingering
+          // end_pass code would be re-scanned by the receiver and end its
+          // next pass instantly, before any chunk is sent.
+          const hide_qr = () => {
+            qr_visible.value = false;
+            qrcode_object.clear();
           };
 
           const hex_to_missing_indices = (hex, total) => {
@@ -81,27 +143,63 @@
             return missing;
           };
 
-          const init_camera = async () => {
-            if (videoElement) return;
-            videoElement = document.getElementById("videoElement");
-            videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
-            });
-            canvas = document.createElement("canvas");
-            context = canvas.getContext("2d");
-            await sleep(2000);
-            canvas.height = videoElement.videoHeight;
-            canvas.width = videoElement.videoWidth;
+          // Chrome/Android exposes non-standard focusMode control; keeps the
+          // camera continuously focused on the QR code instead of hunting.
+          const apply_continuous_focus = (stream) => {
+            let track = stream.getVideoTracks()[0];
+            if (!track || !track.getCapabilities) return;
+            let capabilities = track.getCapabilities();
+            if (capabilities.focusMode && capabilities.focusMode.includes("continuous")) {
+              track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => {});
+            }
           };
 
-          // Waits for a control frame (JSON envelope) whose "type" is in accepted_types.
-          // Ignores chunk frames ("index,base64data") seen while listening.
-          const wait_for_control_frame = async (accepted_types) => {
-            await init_camera();
-            is_listening.value = true;
-            try {
-              while (is_transferring.value) {
-                await sleep(10);
+          const describe_camera_error = (error) => {
+            switch (error.name) {
+              case "NotAllowedError":
+                return "Camera access was denied. Allow camera permission for this page in your browser settings, then retry.";
+              case "NotFoundError":
+                return "No camera was found on this device.";
+              case "NotReadableError":
+                return "The camera is in use by another app, or a hardware error occurred.";
+              case "OverconstrainedError":
+                return "No camera on this device satisfies the requested settings.";
+              default:
+                return `Could not access the camera: ${error.message || error.name}`;
+            }
+          };
+
+          const wait_for_video_ready = (video) =>
+            new Promise((resolve) => {
+              if (video.videoWidth) resolve();
+              else video.addEventListener("loadedmetadata", () => resolve(), { once: true });
+            });
+
+          const stop_camera_stream = () => {
+            if (media_stream) {
+              media_stream.getTracks().forEach((t) => t.stop());
+              media_stream = null;
+            }
+          };
+
+          const stop_camera_scan = () => {
+            scan_abort = true;
+            stop_camera_stream();
+            show_qr(JSON.stringify({ type: "end_pass" }));
+            phase.value = "pass_done";
+            user_message.value = "Scan cancelled. Choose an action below.";
+          };
+
+          const dismiss_camera_error = () => {
+            camera_error.value = null;
+            show_qr(JSON.stringify({ type: "end_pass" }));
+            phase.value = "pass_done";
+          };
+
+          const scan_loop = async () => {
+            while (!scan_abort) {
+              await sleep(10);
+              try {
                 context.drawImage(videoElement, 0, 0);
                 let image_data = context.getImageData(
                   0,
@@ -119,74 +217,120 @@
                 } catch (error) {
                   continue;
                 }
-                if (accepted_types.includes(frame.type)) {
-                  return frame;
+                if (frame.type === "missing") {
+                  report_parts[frame.part] = frame.bitmap;
+                  report_total_parts = frame.parts;
+                  let have = Object.keys(report_parts).length;
+                  report_progress.value = `Report part ${have}/${report_total_parts} captured`;
+                  if (have < report_total_parts) continue;
+                  stop_camera_stream();
+                  let full_bitmap = "";
+                  for (let p = 0; p < report_total_parts; p++) {
+                    full_bitmap += report_parts[p];
+                  }
+                  missing_indices = new Set(
+                    hex_to_missing_indices(full_bitmap, total_chunks)
+                  );
+                  report_progress.value = "";
+                  user_message.value = `Captured ${missing_indices.size} missing chunk(s). Ready to resend.`;
+                  phase.value = "ready_to_resend";
+                  return;
+                } else if (frame.type === "done") {
+                  stop_camera_stream();
+                  user_message.value = "Transfer complete!";
+                  phase.value = "complete";
+                  return;
                 }
+              } catch (error) {
+                console.error("Error in scan loop: ", error);
               }
-              return { type: "aborted" };
-            } finally {
-              is_listening.value = false;
             }
           };
 
-          const stop_transfer = () => {
-            is_transferring.value = false;
-            is_listening.value = false;
-            user_message.value = "Choose file to get started";
-            show_qr("Choose file to get started");
+          const start_camera = async () => {
+            hide_qr();
+            camera_error.value = null;
+            report_parts = {};
+            report_total_parts = 0;
+            report_progress.value = "";
+            phase.value = "camera_scanning";
+            user_message.value = "Point this device's camera at the receiver's screen ...";
+            try {
+              media_stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                  facingMode: "environment",
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                  advanced: [{ focusMode: "continuous" }],
+                },
+              });
+            } catch (error) {
+              camera_error.value = describe_camera_error(error);
+              phase.value = "pass_done";
+              return;
+            }
+            apply_continuous_focus(media_stream);
+            videoElement = document.getElementById("videoElement");
+            videoElement.srcObject = media_stream;
+            canvas = document.createElement("canvas");
+            context = canvas.getContext("2d");
+            await wait_for_video_ready(videoElement);
+            canvas.width = videoElement.videoWidth;
+            canvas.height = videoElement.videoHeight;
+            scan_abort = false;
+            scan_loop();
+          };
+
+          const run_pass = async () => {
+            phase.value = "sending";
+            show_qr(JSON.stringify({ type: "meta", name: file_name, chunks: total_chunks }));
+            user_message.value = "Sending metadata...";
+            await sleep(1000);
+
+            let ordered_missing = Array.from(missing_indices).sort((a, b) => a - b);
+            for (let n = 0; n < ordered_missing.length; n++) {
+              if (phase.value !== "sending") return; // cancelled
+              let idx = ordered_missing[n];
+              show_qr(encode_data(idx, chunks[idx]));
+              user_message.value = `Sending chunk ${n + 1}/${ordered_missing.length} ...`;
+              await sleep(50);
+            }
+            if (phase.value !== "sending") return;
+
+            show_qr(JSON.stringify({ type: "end_pass" }));
+            user_message.value = "Pass complete. Choose an action below.";
+            phase.value = "pass_done";
           };
 
           const start_transfer = async () => {
             let file_input = document.getElementById("file_input");
-            is_transferring.value = true;
             let file = file_input.files[0];
+            if (!file) return;
             let data_array = pako.gzip(await file.arrayBuffer(), { level: 9 });
-            let total_chunks = Math.ceil(data_array.length / chunk_size);
-            let chunks = [];
+            total_chunks = Math.ceil(data_array.length / chunk_size);
+            chunks = [];
             for (let i = 0; i < total_chunks; i++) {
               let start = i * chunk_size;
               chunks.push(data_array.subarray(start, start + chunk_size));
             }
-            let file_metadata = { name: file.name, chunks: total_chunks };
-            let missing = new Set(chunks.map((_, i) => i));
+            file_name = file.name;
+            missing_indices = new Set(chunks.map((_, i) => i));
+            await run_pass();
+          };
 
-            while (missing.size > 0 && is_transferring.value) {
-              show_qr(JSON.stringify({ type: "meta", ...file_metadata }));
-              user_message.value = "Sending metadata...";
-              await sleep(1000);
+          const restart_transfer = async () => {
+            hide_qr();
+            missing_indices = new Set(chunks.map((_, i) => i));
+            await run_pass();
+          };
 
-              let ordered_missing = Array.from(missing).sort((a, b) => a - b);
-              for (let n = 0; n < ordered_missing.length; n++) {
-                if (!is_transferring.value) break;
-                let idx = ordered_missing[n];
-                show_qr(encode_data(idx, chunks[idx]));
-                user_message.value = `Sending chunk ${n + 1}/${ordered_missing.length} ...`;
-                await sleep(50);
-              }
-              if (!is_transferring.value) break;
-
-              show_qr(JSON.stringify({ type: "end_pass" }));
-              user_message.value =
-                "Pass complete. Point this device's camera at the receiver's screen ...";
-              await sleep(1000);
-
-              let response = await wait_for_control_frame(["missing", "done"]);
-              if (!is_transferring.value) break;
-
-              if (response.type === "done") {
-                missing = new Set();
-                user_message.value = "Transfer complete!";
-              } else if (response.type === "missing") {
-                missing = new Set(
-                  hex_to_missing_indices(response.bitmap, total_chunks)
-                );
-                user_message.value = `Retrying ${missing.size} missing chunk(s) ...`;
-                await sleep(1000);
-              } else {
-                break; // aborted
-              }
-            }
-            stop_transfer();
+          const cancel_transfer = () => {
+            scan_abort = true;
+            stop_camera_stream();
+            camera_error.value = null;
+            phase.value = "idle";
+            user_message.value = "Choose file to get started";
+            show_qr("Choose file to get started");
           };
 
           onMounted(() => {
@@ -206,10 +350,17 @@
 
           return {
             user_message,
+            phase,
+            camera_error,
+            report_progress,
+            qr_visible,
             start_transfer,
-            stop_transfer,
-            is_transferring,
-            is_listening,
+            restart_transfer,
+            start_camera,
+            stop_camera_scan,
+            dismiss_camera_error,
+            run_pass,
+            cancel_transfer,
           };
         },
       }).mount("#app");
