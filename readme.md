@@ -37,21 +37,28 @@ Airgapped QR Code Transfer is a simple web-based tool to transfer data between d
 1. Clone the repository:
 
 ```sh
-git clone https://github.com/mohankumarelec/airgap-qr-transfer.git
-cd airgap-qr-transfer
+git clone https://github.com/mohankumarelec/airgapped-qr-code-transfer.git
+cd airgapped-qr-code-transfer
 ```
 
-2. Open the `generator.html` file in your browser for the sender interface:
+2. Install dependencies (copies Vue, pako, qrcode.js, and zbar-wasm into `lib/`):
 
 ```sh
-open generator.html
+npm install
 ```
 
-3. Open the `scanner.html` file in your browser for the receiver interface:
+3. Start the local server:
 
 ```sh
-open scanner.html
+python3 serve.py
 ```
+
+4. Open in your browser:
+
+- **Sender (laptop):** `http://127.0.0.1:8080/generator.html`
+- **Receiver (phone):** `https://<your-laptop-ip>:8443/scanner.html` (accept the self-signed certificate once)
+
+The phone must use HTTPS for camera access. The laptop can use plain HTTP on localhost.
 
 ## Usage
 
