@@ -4,159 +4,549 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="X-UA-Compatible" content="ie=edge" />
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Data Receiver</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        padding: 0;
+        background: #fff;
+      }
+      #app {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 1rem;
+        box-sizing: border-box;
+      }
+      .camera-badge {
+        position: fixed;
+        top: 0.75rem;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 0.75rem;
+        color: #374151;
+        background: #f3f4f6;
+        padding: 0.25rem 0.75rem;
+        border-radius: 999px;
+      }
+      .progress {
+        font-size: 3rem;
+        font-weight: 600;
+        margin: 0;
+      }
+      .status {
+        font-size: 0.875rem;
+        color: #6b7280;
+        margin-top: 0.5rem;
+      }
+      .error {
+        color: #b91c1c;
+        font-size: 0.875rem;
+        text-align: center;
+        margin-top: 1rem;
+      }
+      button {
+        margin-top: 2rem;
+        padding: 0.5rem 1rem;
+        border: 2px solid #6b7280;
+        background: #fff;
+        font-size: 1rem;
+      }
+      button.stop-btn {
+        position: fixed;
+        top: 0.75rem;
+        right: 0.75rem;
+        margin: 0;
+        padding: 0.25rem 0.5rem;
+        font-size: 0.75rem;
+        opacity: 0.5;
+      }
+      button.preview-btn {
+        position: fixed;
+        top: 0.75rem;
+        left: 0.75rem;
+        margin: 0;
+        padding: 0.25rem 0.5rem;
+        font-size: 0.75rem;
+        opacity: 0.8;
+      }
+      #feedback_qrcode {
+        position: fixed;
+        bottom: 1rem;
+        left: 50%;
+        transform: translateX(-50%);
+      }
+      #feedback_qrcode img {
+        width: min(320px, 80vw);
+        height: min(320px, 80vw);
+      }
+      .hidden-camera {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 320px;
+        height: 240px;
+        opacity: 0.0;
+        pointer-events: none;
+        z-index: -1;
+      }
+      .camera-preview {
+        position: fixed;
+        top: 3.25rem;
+        left: 0.75rem;
+        width: min(45vw, 240px);
+        height: auto;
+        aspect-ratio: 4 / 3;
+        object-fit: cover;
+        background: #000;
+        border: 2px solid #111827;
+        border-radius: 0.5rem;
+        z-index: 10;
+      }
+    </style>
   </head>
 
   <body>
     <div id="app">
-      <div
-        class="flex flex-col items-start w-full items-center justify-center align-middle"
-      >
-        <div class="text-xl my-4">Data Receiver Mode</div>
-        <div class="text-sm mb-4">{{user_message}}</div>
-        <div class="text-sm mb-4">
-          Progress: {{Object.keys(decoded_chunks).length}} /
-          {{file_metadata.chunks || 0}}
-        </div>
+      <template v-if="!is_receiving">
+        <p v-if="is_error" class="error">{{ user_message }}</p>
+        <button @click="start_receiver">Start Receiver</button>
+      </template>
+
+      <template v-else>
+        <button class="stop-btn" @click="stop_receiver">Stop</button>
         <button
-          v-if="!is_receiving"
-          v-on:click="start_receiver"
-          class="mb-6 p-1 border-2 border-gray-500"
+          v-if="phase !== 'transferring'"
+          class="preview-btn"
+          @click="toggle_preview"
         >
-          Start Receiver
+          {{ show_camera_preview ? 'Hide View' : 'Show View' }}
         </button>
-        <button
-          v-else
-          v-on:click="stop_receiver"
-          class="mb-6 p-1 border-2 border-gray-500"
-        >
-          Stop Receiver
-        </button>
-        <video id="videoElement" muted autoplay playsinline></video>
-      </div>
+        <div v-if="camera_label" class="camera-badge">{{ camera_label }}</div>
+        <p class="progress">{{ progress_text }}</p>
+        <p v-if="status_text" class="status">{{ status_text }}</p>
+      </template>
+
+      <div id="feedback_qrcode" v-show="is_receiving && show_feedback_qr"></div>
+      <video
+        id="videoElement"
+        :class="show_camera_preview ? 'camera-preview' : 'hidden-camera'"
+        muted
+        autoplay
+        playsinline
+      ></video>
     </div>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <script src="lib/vue.global.js"></script>
+    <script src="lib/qrcode.min.js"></script>
+    <script src="lib/zbar-wasm.js"></script>
+    <script src="lib/pako.min.js"></script>
     <script>
-      const { createApp, ref, reactive, onMounted, computed } = Vue;
+      const { createApp, ref, reactive, computed, onMounted, nextTick } = Vue;
 
       createApp({
         setup() {
-          const user_message = ref("Click receive button to start receiving");
+          const user_message = ref("Open over HTTPS, then tap Start Receiver.");
+          const is_error = ref(false);
           const decoded_chunks = ref({});
-          const total_chunks = ref(-1);
           const file_metadata = reactive({});
           const is_receiving = ref(false);
-          let canvas, context, videoElement;
+          const show_feedback_qr = ref(false);
+          const camera_label = ref("");
+          const phase = ref("waiting");
+          const show_camera_preview = ref(false);
+          let canvas, context, videoElement, camera_ready = false;
+          let feedback_qrcode = null;
+          let last_feedback_payload = "";
+          let session_id = "";
+          let sender_eof = false;
+
+          const received_count = computed(() => {
+            if (!file_metadata.chunks) return 0;
+            let count = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              if (i in decoded_chunks.value) count++;
+            }
+            return count;
+          });
+
+          const progress_text = computed(() => {
+            if (phase.value === "waiting") return "…";
+            if (phase.value === "syncing") return "Sync";
+            if (!file_metadata.chunks) return "…";
+            return `${received_count.value} / ${file_metadata.chunks}`;
+          });
+
+          const status_text = computed(() => {
+            if (phase.value === "waiting") return "Waiting for sender";
+            if (phase.value === "syncing") return "Confirming connection";
+            return "";
+          });
+
+          const get_max_seen_index = () => {
+            const keys = Object.keys(decoded_chunks.value);
+            let max = -1;
+            for (const k of keys) {
+              const n = parseInt(k, 10);
+              if (!Number.isNaN(n) && n > max) max = n;
+            }
+            return max;
+          };
+
+          const get_contiguous_upto = () => {
+            if (typeof file_metadata.chunks !== "number") return -1;
+            let i = 0;
+            while (i < file_metadata.chunks && i in decoded_chunks.value) i++;
+            return i - 1; // -1 means nothing received yet
+          };
+
+          const detect_camera_label = (stream) => {
+            const track = stream.getVideoTracks()[0];
+            if (!track) return "Camera active";
+
+            const settings = track.getSettings?.() || {};
+            if (settings.facingMode === "user") return "Front camera";
+            if (settings.facingMode === "environment") return "Back camera";
+
+            const name = (track.label || "").toLowerCase();
+            if (name.includes("front") || name.includes("user")) return "Front camera";
+            if (name.includes("back") || name.includes("rear") || name.includes("environment")) {
+              return "Back camera";
+            }
+            return track.label || "Camera active";
+          };
+
+          const update_feedback_qr = async (payload) => {
+            if (payload === last_feedback_payload) return;
+            last_feedback_payload = payload;
+
+            if (!payload) {
+              show_feedback_qr.value = false;
+              if (feedback_qrcode) feedback_qrcode.clear();
+              const el = document.getElementById("feedback_qrcode");
+              if (el) el.innerHTML = "";
+              feedback_qrcode = null;
+              return;
+            }
+
+            show_feedback_qr.value = true;
+            await nextTick();
+
+            const el = document.getElementById("feedback_qrcode");
+            if (!el) {
+              console.error("feedback_qrcode element not found");
+              return;
+            }
+
+            const size = Math.min(window.innerWidth * 0.8, 320);
+            if (!feedback_qrcode) {
+              el.innerHTML = "";
+              feedback_qrcode = new QRCode(el, {
+                text: payload,
+                width: size,
+                height: size,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.M,
+              });
+            } else {
+              feedback_qrcode.clear();
+              feedback_qrcode.makeCode(payload);
+            }
+          };
+
+          const parse_sender_message = (decoded_data) => {
+            if (!decoded_data.startsWith("{")) return null;
+            try {
+              return JSON.parse(decoded_data);
+            } catch (_) {
+              return null;
+            }
+          };
 
           const decode_data = (input_string) => {
-            const encoded_data = atob(input_string.split(",")[1]);
-            const encoded_array = Array.from(encoded_data, (char) =>
-              char.charCodeAt(0)
-            );
-            const utf8Decoder = new TextDecoder();
-            const output_string = utf8Decoder.decode(
-              new Uint8Array(encoded_array)
-            );
-            const data_array = Array.from(output_string, (char) =>
-              char.charCodeAt(0)
-            );
-            return {
-              index: parseInt(input_string.split(",")[0]),
-              data: data_array,
-            };
+            try {
+              const parts = input_string.split(",");
+              if (parts.length !== 2) return null;
+              const encoded_data = atob(parts[1]);
+              const encoded_array = Array.from(encoded_data, (char) =>
+                char.charCodeAt(0)
+              );
+              const utf8Decoder = new TextDecoder();
+              const output_string = utf8Decoder.decode(
+                new Uint8Array(encoded_array)
+              );
+              const data_array = Array.from(output_string, (char) =>
+                char.charCodeAt(0)
+              );
+              const index = parseInt(parts[0], 10);
+              if (Number.isNaN(index)) return null;
+              return { index, data: data_array };
+            } catch (_) {
+              return null;
+            }
           };
 
           const download_file = (data, fileName) => {
             const blob = new Blob([data]);
-            const dummy_element = document.createElement("a");
+            const link = document.createElement("a");
             const url = URL.createObjectURL(blob);
-            dummy_element.href = url;
-            dummy_element.download = fileName;
-            dummy_element.click();
+            link.href = url;
+            link.download = fileName;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
             URL.revokeObjectURL(url);
           };
 
           const stop_receiver = () => {
             is_receiving.value = false;
+            phase.value = "waiting";
+            session_id = "";
+            sender_eof = false;
+            show_camera_preview.value = false;
             decoded_chunks.value = {};
             Object.assign(file_metadata, {});
-            user_message.value = "Click receive button to start receiving";
+            is_error.value = false;
+            camera_label.value = "";
+            last_feedback_payload = "";
+            update_feedback_qr("");
+            if (videoElement?.srcObject) {
+              videoElement.srcObject.getTracks().forEach((track) => track.stop());
+              videoElement.srcObject = null;
+            }
+            camera_ready = false;
+            user_message.value = "Stopped. Tap Start Receiver to scan again.";
+          };
+
+          const open_front_camera = async () => {
+            const constraints = [
+              {
+                video: {
+                  facingMode: { exact: "user" },
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                },
+                audio: false,
+              },
+              {
+                video: {
+                  facingMode: "user",
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                },
+                audio: false,
+              },
+            ];
+
+            let last_error = null;
+            for (const constraint of constraints) {
+              try {
+                return await navigator.mediaDevices.getUserMedia(constraint);
+              } catch (err) {
+                last_error = err;
+              }
+            }
+            throw last_error;
+          };
+
+          const init_camera = async () => {
+            if (camera_ready) return true;
+
+            if (!window.isSecureContext) {
+              is_error.value = true;
+              user_message.value =
+                "Camera blocked: open via https:// on this phone.";
+              return false;
+            }
+
+            if (!navigator.mediaDevices?.getUserMedia) {
+              is_error.value = true;
+              user_message.value = "This browser does not support camera access.";
+              return false;
+            }
+
+            try {
+              videoElement = document.getElementById("videoElement");
+              const stream = await open_front_camera();
+              videoElement.srcObject = stream;
+              camera_label.value = detect_camera_label(stream);
+              await videoElement.play();
+              canvas = document.createElement("canvas");
+              context = canvas.getContext("2d");
+
+              await new Promise((resolve) => {
+                if (videoElement.videoWidth) {
+                  resolve();
+                  return;
+                }
+                videoElement.onloadedmetadata = () => resolve();
+              });
+
+              canvas.width = videoElement.videoWidth;
+              canvas.height = videoElement.videoHeight;
+              context.drawImage(videoElement, 0, 0);
+              camera_ready = true;
+              is_error.value = false;
+              return true;
+            } catch (err) {
+              is_error.value = true;
+              user_message.value =
+                "Front camera unavailable. Allow camera in browser settings.";
+              console.error(err);
+              return false;
+            }
+          };
+
+          const handle_sender_payload = (decoded_data) => {
+            const msg = parse_sender_message(decoded_data);
+            if (msg?.type === "sync") {
+              if (!msg.id || !msg.name || typeof msg.chunks !== "number") return;
+              session_id = msg.id;
+              sender_eof = false;
+              Object.assign(file_metadata, {
+                name: msg.name,
+                chunks: msg.chunks,
+              });
+              decoded_chunks.value = {};
+              phase.value = msg.chunks === 0 ? "transferring" : "syncing";
+              return;
+            }
+
+            if (msg?.type === "eof") {
+              if (msg.id && msg.id === session_id) {
+                sender_eof = true;
+              }
+              return;
+            }
+
+            if (phase.value !== "syncing" && phase.value !== "transferring") return;
+
+            const raw_data = decode_data(decoded_data);
+            if (!raw_data) return;
+            if (raw_data.index < 0 || raw_data.index >= file_metadata.chunks) return;
+
+            phase.value = "transferring";
+            // Once transfer starts, hide preview by default so feedback QR remains clear.
+            show_camera_preview.value = false;
+            decoded_chunks.value[raw_data.index] = raw_data.data;
+          };
+
+          const toggle_preview = () => {
+            show_camera_preview.value = !show_camera_preview.value;
           };
 
           const start_receiver = async () => {
+            if (!(await init_camera())) return;
+
             decoded_chunks.value = {};
+            Object.assign(file_metadata, {});
             is_receiving.value = true;
-            while (
-              file_metadata.chunks != Object.keys(decoded_chunks.value).length
-            ) {
+            is_error.value = false;
+            phase.value = "waiting";
+            session_id = "";
+            sender_eof = false;
+            last_feedback_payload = "";
+            show_camera_preview.value = true;
+            await update_feedback_qr(JSON.stringify({ type: "ready" }));
+
+            while (is_receiving.value) {
               try {
                 await new Promise((r) => setTimeout(r, 10));
                 context.drawImage(videoElement, 0, 0);
-                image_data = context.getImageData(
+                const image_data = context.getImageData(
                   0,
                   0,
                   canvas.width,
                   canvas.height
                 );
-                let symbols = await zbarWasm.scanImageData(image_data);
-                if (!symbols || !symbols.length) {
-                  continue;
+                const symbols = await zbarWasm.scanImageData(image_data);
+                if (symbols?.length) {
+                  for (const symbol of symbols) {
+                    handle_sender_payload(symbol.decode());
+                  }
                 }
-                let decoded_data = symbols[0].decode();
-                if (decoded_data.includes("chunks")) {
-                  Object.assign(file_metadata, JSON.parse(decoded_data));
-                  decoded_chunks.value = {};
-                  user_message.value = `Transferring file: ${file_metadata.name}`;
-                } else if (decoded_data.split(",").length == 2) {
-                  let raw_data = decode_data(decoded_data);
-                  decoded_chunks.value[raw_data["index"]] = raw_data["data"];
-                }
-                window.decoded_chunks = decoded_chunks.value;
               } catch (error) {
-                console.error("Error in Loop: ", error);
+                console.error("Error in scan loop:", error);
               }
-              if (!is_receiving.value) {
-                Object.assign(file_metadata, {});
-                decoded_chunks.value = {};
-                user_message.value = "Click receive button to start receiving";
-                return true;
+
+              if (phase.value === "waiting") {
+                await update_feedback_qr(JSON.stringify({ type: "ready" }));
+              } else if (phase.value === "syncing") {
+                await update_feedback_qr(
+                  JSON.stringify({ type: "sync_ack", id: session_id })
+                );
+              } else if (
+                phase.value === "transferring" &&
+                typeof file_metadata.chunks === "number"
+              ) {
+                if (received_count.value === file_metadata.chunks) {
+                  await update_feedback_qr(JSON.stringify({ type: "done" }));
+                  await new Promise((r) => setTimeout(r, 2000));
+
+                  try {
+                    let output_array = [];
+                    for (let i = 0; i < file_metadata.chunks; i++) {
+                      output_array = output_array.concat(decoded_chunks.value[i]);
+                    }
+                    const output_unit8array = Uint8Array.from(output_array);
+                    const inflated_array = pako.inflate(output_unit8array);
+                    download_file(inflated_array, file_metadata.name);
+                  } catch (err) {
+                    console.error("Failed to reconstruct file:", err);
+                    stop_receiver();
+                    is_error.value = true;
+                    user_message.value =
+                      "Transfer failed — corrupted data. Retry.";
+                    return;
+                  }
+                  stop_receiver();
+                  return;
+                }
+
+                const max_seen = get_max_seen_index();
+                const contiguous_upto = get_contiguous_upto();
+                const has_gap = max_seen > contiguous_upto;
+
+                // Only request resend when there is a *real* gap (out-of-order),
+                // or when we've seen EOF (sender finished a pass) and we're still missing tail.
+                if (has_gap || sender_eof) {
+                  const from = Math.max(0, contiguous_upto + 1);
+                  await update_feedback_qr(JSON.stringify({ type: "resend", from }));
+                } else {
+                  await update_feedback_qr(
+                    JSON.stringify({ type: "ack", upto: contiguous_upto })
+                  );
+                }
               }
             }
-            user_message.value = "Data Transfer Complete";
-            output_array = [];
-            for (let i = 0; i < file_metadata.chunks; i++) {
-              output_array = output_array.concat(decoded_chunks.value[i]);
-            }
-            let output_unit8array = Uint8Array.from(output_array);
-            window.output_unit8array = output_unit8array;
-            let infalted_array = pako.inflate(window.output_unit8array);
-            download_file(infalted_array, file_metadata.name);
-            stop_receiver();
           };
 
-          onMounted(async () => {
-            console.log("Application Initialized ...");
-            videoElement = document.getElementById("videoElement");
-            videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
-            });
-            canvas = document.createElement("canvas");
-            context = canvas.getContext("2d");
-            await new Promise((r) => setTimeout(r, 2000));
-            canvas.height = videoElement.videoHeight;
-            canvas.width = videoElement.videoWidth;
-            context.drawImage(videoElement, 0, 0);
+          onMounted(() => {
+            if (location.protocol === "file:") {
+              is_error.value = true;
+              user_message.value =
+                "Opened as a local file — use serve.py and open the https:// URL.";
+            }
           });
 
           return {
             user_message,
+            is_error,
             start_receiver,
             is_receiving,
-            file_metadata,
-            decoded_chunks,
+            camera_label,
+            phase,
+            progress_text,
+            status_text,
+            show_feedback_qr,
             stop_receiver,
+            show_camera_preview,
+            toggle_preview,
           };
         },
       }).mount("#app");

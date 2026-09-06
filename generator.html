@@ -4,52 +4,122 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="X-UA-Compatible" content="ie=edge" />
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Data Sender</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        padding: 1rem;
+      }
+      #app {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        max-width: 640px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 1.25rem;
+        margin: 1rem 0 0.5rem;
+      }
+      .message {
+        font-size: 0.875rem;
+        margin: 0.5rem 0;
+        text-align: center;
+      }
+      .scan-status {
+        font-size: 0.75rem;
+        color: #2563eb;
+        margin: 0.25rem 0;
+        text-align: center;
+      }
+      .error {
+        color: #b91c1c;
+      }
+      input[type="file"] {
+        margin: 1rem 0;
+        max-width: 100%;
+      }
+      button {
+        margin: 1rem 0;
+        padding: 0.5rem 1rem;
+        border: 2px solid #6b7280;
+        background: #fff;
+        font-size: 1rem;
+      }
+      #qrcode {
+        max-width: 100%;
+      }
+      #scanVideo {
+        width: 240px;
+        height: 180px;
+        object-fit: cover;
+        background: #000;
+        border: 2px solid #2563eb;
+        margin-top: 0.5rem;
+      }
+      .scan-label {
+        font-size: 0.75rem;
+        color: #6b7280;
+        margin-top: 0.5rem;
+        text-align: center;
+      }
+    </style>
   </head>
 
   <body>
     <div id="app">
-      <div
-        class="flex flex-col items-start w-full items-center justify-center align-middle"
-      >
-        <div class="text-xl my-4">Data Sender Mode</div>
-        <div class="text-sm mb-4">{{user_message}}</div>
-        <div class="w-1/2 mb-4">
-          <input
-            class="block w-full text-sm text-gray-900 border border-gray-300 cursor-pointer bg-gray-50 focus:outline-none"
-            id="file_input"
-            type="file"
-          />
-        </div>
-        <button
-          v-if="!is_transferring"
-          v-on:click="start_transfer"
-          class="mb-6 p-1 border-2 border-gray-500"
-        >
-          Start Transfer
-        </button>
-        <button
-          v-else
-          v-on:click="stop_transfer"
-          class="mb-6 p-1 border-2 border-gray-500"
-        >
-          Stop Transfer
-        </button>
-        <div id="qrcode" class=""></div>
-      </div>
+      <h1>Data Sender Mode</h1>
+      <p class="message" :class="{ error: is_error }">{{ user_message }}</p>
+      <p v-if="is_camera_on" class="scan-status">{{ scan_status }}</p>
+      <input id="file_input" type="file" />
+      <button v-if="!is_camera_on" @click="enable_camera">Enable Camera</button>
+      <button v-if="!is_transferring" @click="start_transfer">
+        Start Transfer
+      </button>
+      <button v-else @click="stop_transfer">Stop Transfer</button>
+      <div id="qrcode"></div>
+      <p v-if="is_camera_on" class="scan-label">
+        Point this camera at the phone screen (feedback QR at bottom)
+      </p>
+      <video
+        id="scanVideo"
+        v-show="is_camera_on"
+        muted
+        autoplay
+        playsinline
+      ></video>
     </div>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <script src="lib/vue.global.js"></script>
+    <script src="lib/qrcode.min.js"></script>
+    <script src="lib/zbar-wasm.js"></script>
+    <script src="lib/pako.min.js"></script>
     <script>
-      const { createApp, ref, onMounted } = Vue;
+      const { createApp, ref, onMounted, nextTick } = Vue;
 
       createApp({
         setup() {
-          const user_message = ref("Choose file to get started");
+          const user_message = ref(
+            "Enable camera, choose file, start receiver on phone first."
+          );
+          const scan_status = ref("Camera off");
           const is_transferring = ref(false);
+          const is_camera_on = ref(false);
+          const is_error = ref(false);
           const chunk_size = 250;
+          const chunk_dwell_ms = 120;
           let qrcode_object = "";
+          let scan_video, scan_canvas, scan_context, scan_ready = false;
+          let scan_loop_running = false;
+          let latest_phone_message = null;
+          const PHONE_TYPES = new Set(["ready", "sync_ack", "ack", "resend", "done"]);
+
+          const clear_phone_message = () => {
+            latest_phone_message = null;
+          };
+
+          const is_phone_feedback = (msg) =>
+            msg && PHONE_TYPES.has(msg.type);
 
           const encode_data = (index, input_bytes) => {
             let encoded_string = String.fromCharCode.apply(null, input_bytes);
@@ -61,44 +131,285 @@
             return index + "," + encoded_data;
           };
 
-          const stop_transfer = () => {
-            is_transferring.value = false;
-            user_message.value = "Choose file to get started";
-          };
-
-          const start_transfer = async () => {
-            let file_input = document.getElementById("file_input");
-            is_transferring.value = true;
-            let file = file_input.files[0];
-            let data_chunks = [];
-            let data_array = pako.gzip(await file.arrayBuffer(), { level: 9 });
-            let total_chunks = Math.ceil(data_array.length / chunk_size);
-            let file_metadata = { name: file.name, chunks: total_chunks };
-            qrcode_object.clear();
-            qrcode_object.makeCode(JSON.stringify(file_metadata));
-            user_message.value = "Starting data transfer in few seconds ...";
-            await new Promise((r) => setTimeout(r, 1000));
-            for (let i = 0; i < total_chunks; i++) {
-              await new Promise((r) => setTimeout(r, 50));
-              let start = i * chunk_size;
-              let chunk = data_array.subarray(start, start + chunk_size);
-              let encoded_data = encode_data(i, chunk);
-              qrcode_object.clear();
-              qrcode_object.makeCode(encoded_data);
-              user_message.value = `Transfering Chunk ${i}/${total_chunks} ...`;
-              if (!is_transferring.value) {
-                user_message.value = "Choose file to get started";
-                qrcode_object.clear();
-                qrcode_object.makeCode("Choose file to get started");
-                break;
+          const parse_phone_messages = (symbols) => {
+            for (const symbol of symbols) {
+              try {
+                const msg = JSON.parse(symbol.decode());
+                if (is_phone_feedback(msg)) return msg;
+              } catch (_) {
+                continue;
               }
             }
-            stop_transfer();
+            return null;
+          };
+
+          const init_scan_camera = async () => {
+            if (scan_ready) return true;
+
+            if (!window.isSecureContext) {
+              is_error.value = true;
+              user_message.value =
+                "Camera blocked: open via http://127.0.0.1:8080 or https.";
+              return false;
+            }
+
+            try {
+              scan_video = document.getElementById("scanVideo");
+              scan_video.srcObject = await navigator.mediaDevices.getUserMedia({
+                video: {
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                },
+              });
+              await scan_video.play();
+              scan_canvas = document.createElement("canvas");
+              scan_context = scan_canvas.getContext("2d");
+
+              await new Promise((resolve) => {
+                if (scan_video.videoWidth) {
+                  resolve();
+                  return;
+                }
+                scan_video.onloadedmetadata = () => resolve();
+              });
+
+              scan_canvas.width = scan_video.videoWidth;
+              scan_canvas.height = scan_video.videoHeight;
+              scan_ready = true;
+              is_error.value = false;
+              start_phone_scan_loop();
+              return true;
+            } catch (err) {
+              is_error.value = true;
+              user_message.value =
+                "Camera permission denied. Allow camera to read phone feedback.";
+              console.error(err);
+              return false;
+            }
+          };
+
+          const start_phone_scan_loop = () => {
+            if (scan_loop_running) return;
+            scan_loop_running = true;
+
+            const loop = async () => {
+              while (scan_loop_running && scan_ready) {
+                try {
+                  scan_context.drawImage(scan_video, 0, 0);
+                  const image_data = scan_context.getImageData(
+                    0,
+                    0,
+                    scan_canvas.width,
+                    scan_canvas.height
+                  );
+                  const symbols = await zbarWasm.scanImageData(image_data);
+                  const msg = parse_phone_messages(symbols || []);
+                  if (msg) {
+                    latest_phone_message = msg;
+                    if (msg.type === "ready") {
+                      scan_status.value = "Phone ready — waiting to sync";
+                    } else if (msg.type === "sync_ack") {
+                      scan_status.value = "Sync confirmed";
+                    } else if (msg.type === "ack") {
+                      scan_status.value =
+                        typeof msg.upto === "number"
+                          ? `Phone ack upto chunk ${msg.upto + 1}`
+                          : "Phone ack";
+                    } else if (msg.type === "resend") {
+                      scan_status.value = `Phone requests resend from chunk ${msg.from + 1}`;
+                    } else if (msg.type === "done") {
+                      scan_status.value = "Phone reports transfer complete";
+                    }
+                  }
+                } catch (err) {
+                  console.error("Phone scan loop:", err);
+                }
+                await new Promise((r) => setTimeout(r, 30));
+              }
+            };
+            loop();
+          };
+
+          const stop_phone_scan_loop = () => {
+            scan_loop_running = false;
+            latest_phone_message = null;
+            scan_status.value = "Camera off";
+          };
+
+          const wait_for_phone_message = async (predicate, timeout_ms) => {
+            clear_phone_message();
+            const started = Date.now();
+            while (Date.now() - started < timeout_ms) {
+              if (!is_transferring.value) return null;
+              const msg = latest_phone_message;
+              if (msg && predicate(msg)) return msg;
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            return null;
+          };
+
+          const show_chunk_qr = (text) => {
+            qrcode_object.clear();
+            qrcode_object.makeCode(text);
+          };
+
+          const stop_transfer = () => {
+            is_transferring.value = false;
+            clear_phone_message();
+            user_message.value = is_camera_on.value
+              ? "Camera ready. Start receiver on phone, then transfer."
+              : "Enable camera first.";
+          };
+
+          const enable_camera = async () => {
+            is_camera_on.value = true;
+            await nextTick();
+            if (await init_scan_camera()) {
+              scan_status.value = "Watching phone — start receiver on phone";
+              user_message.value =
+                "Camera ready. Start receiver on phone, then start transfer.";
+            } else {
+              is_camera_on.value = false;
+              stop_phone_scan_loop();
+            }
+          };
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          const start_transfer = async () => {
+            if (!is_camera_on.value) {
+              await enable_camera();
+              if (!scan_ready) return;
+            }
+
+            const file_input = document.getElementById("file_input");
+            const file = file_input.files[0];
+            if (!file) {
+              user_message.value = "Select a file first.";
+              return;
+            }
+
+            is_transferring.value = true;
+            is_error.value = false;
+            clear_phone_message();
+
+            const data_array = pako.gzip(await file.arrayBuffer(), {
+              level: 9,
+            });
+            const total_chunks = Math.ceil(data_array.length / chunk_size);
+            const session_id = String(Date.now());
+
+            user_message.value = "Checking phone is ready…";
+            const ready = await wait_for_phone_message(
+              (msg) => msg.type === "ready",
+              30000
+            );
+            if (!ready) {
+              user_message.value =
+                "Phone not detected. Start receiver on phone and point it here.";
+              is_transferring.value = false;
+              return;
+            }
+
+            show_chunk_qr(
+              JSON.stringify({
+                type: "sync",
+                id: session_id,
+                name: file.name,
+                chunks: total_chunks,
+              })
+            );
+            user_message.value = "Syncing… Keep phone pointed at this QR.";
+            scan_status.value = "Waiting for phone sync_ack";
+
+            let sync_ack = null;
+            const sync_deadline = Date.now() + 30000;
+            while (Date.now() < sync_deadline && is_transferring.value) {
+              show_chunk_qr(
+                JSON.stringify({
+                  type: "sync",
+                  id: session_id,
+                  name: file.name,
+                  chunks: total_chunks,
+                })
+              );
+              sync_ack = await wait_for_phone_message(
+                (msg) => msg.type === "sync_ack" && msg.id === session_id,
+                2000
+              );
+              if (sync_ack) break;
+            }
+            if (!sync_ack) {
+              user_message.value =
+                "Sync failed. Keep phone pointed at sync QR and retry.";
+              is_transferring.value = false;
+              return;
+            }
+
+            clear_phone_message();
+            user_message.value = "Synced. Transferring…";
+            scan_status.value = "Transfer in progress";
+
+            let index = 0;
+
+            while (is_transferring.value) {
+              if (index >= total_chunks) {
+                show_chunk_qr(JSON.stringify({ type: "eof", id: session_id }));
+                user_message.value = "Checking for missing chunks…";
+                const resend_msg = await wait_for_phone_message(
+                  (msg) => msg.type === "resend" || msg.type === "done",
+                  60000
+                );
+
+                if (!is_transferring.value) return;
+
+                if (resend_msg?.type === "done") {
+                  user_message.value = "Transfer complete.";
+                  stop_transfer();
+                  return;
+                }
+                if (resend_msg?.type === "resend") {
+                  index = resend_msg.from;
+                  user_message.value = `Resuming from chunk ${index + 1}/${total_chunks}…`;
+                  continue;
+                }
+
+                user_message.value =
+                  "Phone not confirmed. Point laptop camera at phone QR and wait…";
+                continue;
+              }
+
+              const start = index * chunk_size;
+              const chunk = data_array.subarray(start, start + chunk_size);
+              show_chunk_qr(encode_data(index, chunk));
+              user_message.value = `Chunk ${index + 1}/${total_chunks}`;
+
+              const dwell_start = Date.now();
+              let jumped = false;
+
+              while (Date.now() - dwell_start < chunk_dwell_ms) {
+                if (!is_transferring.value) return;
+                await sleep(20);
+
+                const msg = latest_phone_message;
+                if (
+                  msg?.type === "resend" &&
+                  typeof msg.from === "number" &&
+                  msg.from <= index
+                ) {
+                  index = msg.from;
+                  jumped = true;
+                  scan_status.value = `Resuming from chunk ${index + 1}`;
+                  break;
+                }
+              }
+
+              if (!jumped) index++;
+            }
           };
 
           onMounted(() => {
-            console.log("Application Initialized ...");
-            let lowest_size =
+            const lowest_size =
               Math.min(window.innerWidth, window.innerHeight) / 1.5;
             qrcode_object = new QRCode("qrcode", {
               text: "Choose file to get started",
@@ -113,6 +424,10 @@
 
           return {
             user_message,
+            scan_status,
+            is_error,
+            enable_camera,
+            is_camera_on,
             start_transfer,
             stop_transfer,
             is_transferring,
